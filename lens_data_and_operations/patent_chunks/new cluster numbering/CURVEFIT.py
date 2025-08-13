@@ -1,148 +1,175 @@
+# CURVEFIT.py (fixed bounds to avoid Growth=2029 issue)
 import pandas as pd
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.optimize import least_squares
 
-# ---- Logistic (as in the paper) ----
-# f(t) = k / (1 + exp(-(t - a) / b))
-def logistic(t, k, a, b):
-    return k / (1 + np.exp(-(t - a) / b))
+def logistic_rel(t_rel, k, a_rel, b):
+    return k / (1.0 + np.exp(-(t_rel - a_rel) / b))
 
-def year_at_pct(k, a, b, pct):
-    """Year when f(t) reaches pct of K. Returns float (calendar year)."""
-    if not np.all(np.isfinite([k, a, b])) or k <= 0 or b == 0 or not (0 < pct < 1):
+def year_at_pct_rel(k, a_rel, b, pct):
+    if not np.all(np.isfinite([k, a_rel, b])) or k <= 0 or b == 0 or not (0 < pct < 1):
         return np.nan
     try:
-        return a + b * (-np.log((1.0/pct) - 1.0))
+        return a_rel + b * (-np.log((1.0 / pct) - 1.0))
     except Exception:
         return np.nan
 
 INPUT_FILE  = "sigma_input_cumulative_no2025.csv"
 OUT_VALID   = "cluster_lifecycle_fit_VALID.csv"
 OUT_REJECT  = "cluster_lifecycle_fit_REJECTED.csv"
+OUT_SIMPLE_COMMA = "cluster_stage_years_only.csv"
+OUT_SIMPLE_SEMI  = "cluster_stage_years_only_semicolon.csv"
+OUT_SIMPLE_TSV   = "cluster_stage_years_only.tsv"
 
-# ---- Load & sanitize ----
 df = pd.read_csv(INPUT_FILE)
 df.columns = [c.strip() for c in df.columns]
-
-need = {"Cluster ID","Cluster Name","Year","Cumulative Count"}
-if not need.issubset(df.columns):
-    raise ValueError(f"Missing columns. Have {list(df.columns)}, need {list(need)}")
+req = {"Cluster ID","Cluster Name","Year","Cumulative Count"}
+if not req.issubset(df.columns):
+    raise ValueError("Missing required columns")
 
 df = df.rename(columns={
     "Cluster ID":"cluster_id",
     "Cluster Name":"cluster_name",
     "Year":"year",
     "Cumulative Count":"cum"
-})
+}).dropna(subset=["cluster_id","cluster_name","year","cum"])
 
-df = df.dropna(subset=["cluster_id","cluster_name","year","cum"]).copy()
 df["year"] = df["year"].astype(int)
 df["cum"]  = df["cum"].astype(float)
 
 valid_rows, rejected_rows = [], []
 
-for (cid, cname), g in df.groupby(["cluster_id","cluster_name"]):
+for (cid, cname), g in df.groupby(["cluster_id","cluster_name"], sort=False):
     g = g.sort_values("year").drop_duplicates("year", keep="last").copy()
-    # enforce non-decreasing cumulative (safety)
     g["cum"] = g["cum"].cummax()
 
-    years = g["year"].to_numpy(dtype=float)
-    y     = g["cum"].to_numpy(dtype=float)
+    years = g["year"].to_numpy(float)
+    y     = g["cum"].to_numpy(float)
 
-    out_base = {
+    base = {
         "cluster_id": cid,
         "cluster_name": cname,
-        "first_year": int(years.min()) if len(years)>0 else np.nan,
-        "last_year":  int(years.max()) if len(years)>0 else np.nan,
+        "first_year": int(years.min()) if len(years) else np.nan,
+        "last_year":  int(years.max()) if len(years) else np.nan,
         "n_years":    int(len(years))
     }
 
-    # basic eligibility
     if len(years) < 4 or y[-1] <= 0:
-        rejected_rows.append({**out_base,
-                              "emerging_year": np.nan,
-                              "growth_year": np.nan,
-                              "maturity_year": np.nan,
-                              "saturation_year": np.nan,
-                              "k": np.nan, "a": np.nan, "b": np.nan,
-                              "notes": "insufficient_data"})
+        rejected_rows.append({**base,
+            "emerging_year":np.nan,"growth_year":np.nan,"maturity_year":np.nan,"saturation_year":np.nan,
+            "k":np.nan,"a":np.nan,"b":np.nan,"R2":np.nan,"RMSE":np.nan,"notes":"insufficient_data"})
         continue
 
-    # ---- Fit logistic (bounded) ----
+    # --- reparameterize time to [0, tmax] ---
+    t0 = years.min()
+    t_rel = years - t0
+    t_range = t_rel.max()
+    if t_range <= 0:
+        rejected_rows.append({**base,
+            "emerging_year":np.nan,"growth_year":np.nan,"maturity_year":np.nan,"saturation_year":np.nan,
+            "k":np.nan,"a":np.nan,"b":np.nan,"R2":np.nan,"RMSE":np.nan,"notes":"zero_time_range"})
+        continue
+
+    # --- init guesses ---
+    k_min = y.max()
+    k_max = 3.0 * y.max()
+    k0 = min(max(1.15*y[-1], k_min), k_max)  # between [max(y), 3*max(y)]
+
+    # a0: closest to halfway between min and last observed cum (robust to early noise)
+    half_obs = (y[0] + y[-1]) / 2.0
+    a0_rel = float(t_rel[np.argmin(np.abs(y - half_obs))])
+
+    b0 = max(0.2, 0.25 * t_range)
+
+    # bounds
+    lb = np.array([k_min, 0.0,               0.05])
+    ub = np.array([k_max, t_range, max(2.0, 0.5*t_range)])
+
+    # residuals
+    def resid(params):
+        k,a_rel,b = params
+        return logistic_rel(t_rel, k, a_rel, b) - y
+
     try:
-        k0 = max(y) * 1.05
-        # rough a0 ~ year of fastest observed increment
-        dy = np.diff(y, prepend=y[0])
-        a0 = years[np.argmax(dy)]
-        b0 = 1.0
+        res = least_squares(resid, x0=np.array([k0, a0_rel, b0]),
+                            bounds=(lb, ub), loss='soft_l1', max_nfev=20000)
+        k_fit, a_rel_fit, b_fit = res.x
+        yhat = logistic_rel(t_rel, k_fit, a_rel_fit, b_fit)
 
-        lower = [max(y), years.min()-5, 0.01]          # k >= max(y), a in [min-5, max+5], b>0
-        upper = [max(y)*10, years.max()+5, 10.0]
+        # mark if any param at/near bound
+        eps = 1e-6
+        at_bound = (abs(k_fit-lb[0])<eps) or (abs(k_fit-ub[0])<eps) or \
+                   (abs(a_rel_fit-lb[1])<eps) or (abs(a_rel_fit-ub[1])<eps) or \
+                   (abs(b_fit-lb[2])<eps) or (abs(b_fit-ub[2])<eps)
 
-        (k_fit, a_fit, b_fit), _ = curve_fit(
-            logistic, years, y,
-            p0=[k0, a0, b0],
-            bounds=(lower, upper),
-            maxfev=20000
-        )
+        # stage years (calendar)
+        emerg_rel = year_at_pct_rel(k_fit, a_rel_fit, b_fit, 0.10)
+        grow_rel  = year_at_pct_rel(k_fit, a_rel_fit, b_fit, 0.50)  # = a_rel_fit
+        matur_rel = year_at_pct_rel(k_fit, a_rel_fit, b_fit, 0.90)
+        satur_rel = matur_rel + 5.0 if np.isfinite(matur_rel) else np.nan
 
-        # stage thresholds per paper
-        emerg = year_at_pct(k_fit, a_fit, b_fit, 0.10)
-        grow  = year_at_pct(k_fit, a_fit, b_fit, 0.50)
-        matur = year_at_pct(k_fit, a_fit, b_fit, 0.90)
-        satur = (matur + 5) if np.isfinite(matur) else np.nan
+        def to_year(x_rel):
+            return int(round(t0 + x_rel)) if np.isfinite(x_rel) else np.nan
 
-        # round to integer calendar years
-        def rnd(x): return int(round(x)) if np.isfinite(x) else np.nan
-        emerg_r, grow_r, matur_r, satur_r = map(rnd, [emerg, grow, matur, satur])
+        emerg_y, grow_y, matur_y, satur_y = map(to_year, [emerg_rel, grow_rel, matur_rel, satur_rel])
 
-        # --- Monotonicity & sanity checks ---
         notes = []
-        # All must be finite integers
-        if any([pd.isna(v) for v in [emerg_r, grow_r, matur_r, satur_r]]):
+        if any(pd.isna(v) for v in [emerg_y, grow_y, matur_y, satur_y]):
             notes.append("nan_stage_year")
-        # strict increasing
-        if not notes and not (emerg_r < grow_r < matur_r < satur_r):
+        if not notes and not (emerg_y < grow_y < matur_y < satur_y):
             notes.append("non_monotonic_stage_years")
-        # saturation defined as maturity+5 already ensures last > prev, but keep check above.
+        if at_bound:
+            notes.append("at_bound")
+
+        ss_res = float(np.sum((y - yhat)**2))
+        ss_tot = float(np.sum((y - y.mean())**2))
+        R2 = 1 - ss_res/ss_tot if ss_tot>0 else np.nan
+        RMSE = float(np.sqrt(np.mean((y - yhat)**2)))
 
         if notes:
-            rejected_rows.append({**out_base,
-                                  "emerging_year": emerg_r,
-                                  "growth_year": grow_r,
-                                  "maturity_year": matur_r,
-                                  "saturation_year": satur_r,
-                                  "k": float(k_fit), "a": float(a_fit), "b": float(b_fit),
-                                  "notes": ";".join(notes)})
+            rejected_rows.append({**base,
+                "emerging_year":emerg_y,"growth_year":grow_y,"maturity_year":matur_y,"saturation_year":satur_y,
+                "k":float(k_fit),"a":float(t0 + a_rel_fit),"b":float(b_fit),
+                "R2":float(R2) if np.isfinite(R2) else np.nan,
+                "RMSE":float(RMSE) if np.isfinite(RMSE) else np.nan,
+                "notes":";".join(notes)})
             continue
 
-        # Optional fit quality (R^2)
-        yhat = logistic(years, k_fit, a_fit, b_fit)
-        ss_res = float(np.sum((y - yhat)**2))
-        ss_tot = float(np.sum((y - np.mean(y))**2))
-        r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
-        rmse = float(np.sqrt(np.mean((y - yhat)**2)))
-
-        valid_rows.append({**out_base,
-                           "emerging_year": emerg_r,
-                           "growth_year": grow_r,
-                           "maturity_year": matur_r,
-                           "saturation_year": satur_r,
-                           "k": float(k_fit), "a": float(a_fit), "b": float(b_fit),
-                           "R2": float(r2) if np.isfinite(r2) else np.nan,
-                           "RMSE": float(rmse) if np.isfinite(rmse) else np.nan,
-                           "notes": ""})
+        valid_rows.append({**base,
+            "emerging_year":emerg_y,"growth_year":grow_y,"maturity_year":matur_y,"saturation_year":satur_y,
+            "k":float(k_fit),"a":float(t0 + a_rel_fit),"b":float(b_fit),
+            "R2":float(R2) if np.isfinite(R2) else np.nan,
+            "RMSE":float(RMSE) if np.isfinite(RMSE) else np.nan,
+            "notes":""})
 
     except Exception as e:
-        rejected_rows.append({**out_base,
-                              "emerging_year": np.nan,
-                              "growth_year": np.nan,
-                              "maturity_year": np.nan,
-                              "saturation_year": np.nan,
-                              "k": np.nan, "a": np.nan, "b": np.nan,
-                              "notes": f"fit_failed:{type(e).__name__}"})
+        rejected_rows.append({**base,
+            "emerging_year":np.nan,"growth_year":np.nan,"maturity_year":np.nan,"saturation_year":np.nan,
+            "k":np.nan,"a":np.nan,"b":np.nan,"R2":np.nan,"RMSE":np.nan,
+            "notes":f"fit_failed:{type(e).__name__}"})
 
-# ---- Save outputs ----
-pd.DataFrame(valid_rows).sort_values(["cluster_id","cluster_name"]).to_csv(OUT_VALID, index=False, encoding="utf-8-sig")
-pd.DataFrame(rejected_rows).sort_values(["cluster_id","cluster_name"]).to_csv(OUT_REJECT, index=False, encoding="utf-8-sig")
-print(f"Saved:\n - {OUT_VALID}\n - {OUT_REJECT}")
+# ----- save outputs safely -----
+if valid_rows:
+    pd.DataFrame(valid_rows).sort_values(["cluster_id","cluster_name"]).to_csv(OUT_VALID, index=False, encoding="utf-8-sig")
+    print(f"✅ {OUT_VALID}")
+else:
+    print("⚠️ هیچ خوشه‌ای معتبر نبود؛ VALID ساخته نشد.")
+
+if rejected_rows:
+    pd.DataFrame(rejected_rows).sort_values(["cluster_id","cluster_name"]).to_csv(OUT_REJECT, index=False, encoding="utf-8-sig")
+    print(f"📄 {OUT_REJECT}")
+else:
+    print("ℹ️ هیچ خوشه‌ای رد نشد؛ REJECTED ساخته نشد.")
+
+# simple outputs
+if valid_rows:
+    simple = pd.DataFrame(valid_rows, columns=["cluster_id","emerging_year","growth_year","maturity_year","saturation_year"]).copy()
+    for c in ["emerging_year","growth_year","maturity_year","saturation_year"]:
+        simple[c] = pd.to_numeric(simple[c], errors="coerce").astype("Int64")
+    simple = simple.sort_values("cluster_id")
+    simple.to_csv(OUT_SIMPLE_COMMA, index=False, encoding="utf-8-sig")
+    simple.to_csv(OUT_SIMPLE_SEMI,  index=False, encoding="utf-8-sig", sep=";")
+    simple.to_csv(OUT_SIMPLE_TSV,   index=False, encoding="utf-8-sig", sep="\t")
+    print(f"🧾 {OUT_SIMPLE_COMMA} | {OUT_SIMPLE_SEMI} | {OUT_SIMPLE_TSV}")
+else:
+    print("⚠️ چون VALID خالی بود، فایل ساده ساخته نشد.")
