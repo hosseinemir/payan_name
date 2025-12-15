@@ -2,6 +2,11 @@ lens_data_and_operations/csv_files/
 lens_data_and_operations/old/
 lens_data_and_operations/patent_chunks/clean_patent/
 lens_data_and_operations/patent_chunks/source_target_maker/
-scopus-data
+scopus-data/0-raw-data
+scopus-data/1-clean-data-level1
+scopus-data/2-source-target-files
+scopus-data/3-clustered-file
+
+
 
 
